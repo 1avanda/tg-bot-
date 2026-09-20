@@ -1,0 +1,350 @@
+import logging
+from datetime import date, datetime, timedelta
+from typing import Optional
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ContextTypes, ConversationHandler
+
+from services import TaskService
+from utils import keyboards as kb
+from utils.exceptions import BotError
+# Импортируем состояния из основного модуля
+from bot import TaskState
+
+logger = logging.getLogger(__name__)
+
+async def newtask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Начало процесса создания новой задачи."""
+    await update.message.reply_text(
+        "Введите название задачи:", 
+        reply_markup=kb.main_menu_keyboard()
+    )
+    return TaskState.TITLE
+
+async def task_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка названия задачи."""
+    context.user_data["title"] = update.message.text.strip()
+    
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Пропустить", callback_data="skip_desc")],
+            [InlineKeyboardButton("Отмена", callback_data="cancel")],
+        ]
+    )
+    await update.message.reply_text("Введите описание (или пропустите):", reply_markup=keyboard)
+    return TaskState.DESCRIPTION
+
+async def task_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка описания задачи."""
+    context.user_data["description"] = update.message.text.strip()
+    await ask_category(update, context)
+    return TaskState.CATEGORY
+
+async def skip_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Пропуск ввода описания."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["description"] = None
+    await ask_category(update, context)
+    return TaskState.CATEGORY
+
+async def ask_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка клавиатуры выбора категории."""
+    keyboard = kb.task_category_keyboard()
+    if update.callback_query:
+        await update.callback_query.edit_message_text("Выберите категорию:", reply_markup=keyboard)
+    else:
+        await update.message.reply_text("Выберите категорию:", reply_markup=keyboard)
+
+async def task_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выбора категории."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel":
+        return ConversationHandler.END
+        
+    context.user_data["category"] = query.data
+    today = date.today()
+    
+    keyboard = kb.task_date_keyboard(
+        today.strftime('%d.%m'),
+        (today + timedelta(days=1)).strftime('%d.%m'),
+        (today + timedelta(days=2)).strftime('%d.%m')
+    )
+    await query.edit_message_text("Выберите дату:", reply_markup=keyboard)
+    return TaskState.DEADLINE_DATE
+
+async def task_deadline_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выбора даты."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+    
+    if choice == "cancel":
+        return ConversationHandler.END
+    if choice == "custom_date":
+        await query.edit_message_text("Введите дату: ДД.ММ или ДД.ММ.ГГГГ")
+        return TaskState.CUSTOM_DATE
+        
+    today = date.today()
+    mapping = {
+        "today": today,
+        "tomorrow": today + timedelta(days=1),
+        "after_tomorrow": today + timedelta(days=2),
+    }
+    selected = mapping.get(choice)
+    if not selected:
+        await query.edit_message_text("Ошибка. Начните заново.")
+        return ConversationHandler.END
+        
+    context.user_data["deadline_date"] = selected.strftime("%Y-%m-%d")
+    await ask_time(update, context)
+    return TaskState.DEADLINE_TIME
+
+async def task_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка ввода произвольной даты."""
+    import nlp
+    selected = nlp.parse_date(update.message.text.strip())
+    if not selected:
+        await update.message.reply_text("Неверный формат. Пример: 24.06 или 24.06.2026")
+        return TaskState.CUSTOM_DATE
+    if selected < date.today():
+        await update.message.reply_text("Дата не может быть в прошлом.")
+        return TaskState.CUSTOM_DATE
+    context.user_data["deadline_date"] = selected.strftime("%Y-%m-%d")
+    await ask_time(update, context)
+    return TaskState.DEADLINE_TIME
+
+async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправка клавиатуры выбора времени."""
+    keyboard = kb.task_time_keyboard()
+    if update.callback_query:
+        await update.callback_query.edit_message_text("Выберите время:", reply_markup=keyboard)
+    else:
+        await update.message.reply_text("Выберите время:", reply_markup=keyboard)
+
+async def task_deadline_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка выбора времени."""
+    query = update.callback_query
+    await query.answer()
+    if query.data == "custom_time":
+        await query.edit_message_text("Введите время ЧЧ:ММ, например 14:30")
+        return TaskState.CUSTOM_TIME
+    if query.data == "cancel":
+        return ConversationHandler.END
+    context.user_data["deadline_time"] = query.data
+    await finish_task(update, context)
+    return ConversationHandler.END
+
+async def task_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка ввода произвольного времени."""
+    time_str = update.message.text.strip()
+    try:
+        datetime.strptime(time_str, "%H:%M")
+    except ValueError:
+        await update.message.reply_text("Неверный формат. Пример: 14:30")
+        return TaskState.CUSTOM_TIME
+    context.user_data["deadline_time"] = time_str
+    await finish_task(update, context)
+    return ConversationHandler.END
+
+async def finish_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Завершение создания задачи и запись в БД через TaskService."""
+    try:
+        deadline = datetime.strptime(
+            f"{context.user_data['deadline_date']} {context.user_data['deadline_time']}",
+            "%Y-%m-%d %H:%M",
+        )
+        from bot import uid, schedule_task_reminder, send_menu
+        user_id = uid(update)
+        
+        TaskService.create_task(
+            user_id,
+            context.user_data["title"],
+            context.user_data.get("description"),
+            context.user_data.get("category", "other"),
+            deadline
+        )
+        
+        schedule_task_reminder(context, update.effective_chat.id, context.user_data["title"], deadline)
+        
+        text = f"Задача «{context.user_data['title']}» создана."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text)
+        else:
+            await update.message.reply_text(text)
+            
+    except BotError as e:
+        await update.effective_message.reply_text(f"❌ Ошибка: {e.message}")
+    except Exception as e:
+        logger.error(f"Unexpected error in finish_task: {e}")
+        await update.effective_message.reply_text("Произошла непредвиденная ошибка.")
+    finally:
+        context.user_data.clear()
+        from bot import send_menu
+        await send_menu(update, context)
+
+async def mytasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отображение списка активных задач пользователя."""
+    if update.callback_query:
+        await update.callback_query.answer()
+    
+    from bot import uid
+    user_id = uid(update)
+    
+    try:
+        tasks_list = TaskService.get_user_tasks(user_id)
+        keyboard = []
+        if not tasks_list:
+            text = "Активных задач нет. ✨"
+        else:
+            lines = ["📋 *Ваши активные задачи:*"]
+            for task in tasks_list:
+                dl = task["deadline"]
+                when = ""
+                if dl:
+                    try:
+                        dt = datetime.strptime(str(dl)[:19], "%Y-%m-%d %H:%M:%S")
+                        when = dt.strftime(" ⏰ %d.%m %H:%M")
+                    except ValueError:
+                        when = f" ⏰ {dl}"
+                
+                cat_map = {"work": "Работа", "personal": "Личное", "study": "Учёба", "other": "Другое"}
+                category = cat_map.get(task["category"], task["category"])
+                bell = "🔔" if task["reminder_enabled"] else "🔕"
+                
+                lines.append(f"• {task['title']}{when} [{category}] {bell}")
+                keyboard.append([InlineKeyboardButton(f"⚙️ {task['title']}", callback_data=f"task_{task['id']}")])
+        text = "\n".join(lines)
+
+        keyboard.append([InlineKeyboardButton("🏠 В главное меню", callback_data="back_main")])
+        markup = InlineKeyboardMarkup(keyboard)
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+            
+    except BotError as e:
+        await update.effective_message.reply_text(f"❌ Ошибка: {e.message}")
+
+async def show_task_detail(query, task_id: int) -> None:
+    """Отображение деталей конкретной задачи."""
+    try:
+        task = TaskService.get_task_details(task_id)
+        desc = f"\n{task['description']}" if task["description"] else ""
+        reminder = "🔔 Вкл" if task["reminder_enabled"] else "🔕 Выкл"
+        status = "выполнена" if task["is_completed"] else "активна"
+        
+        cat_map = {"work": "Работа", "personal": "Личное", "study": "Учёба", "other": "Другое"}
+        category = cat_map.get(task["category"], task["category"])
+        
+        text = (
+            f"{task['title']}{desc}\n"
+            f"Категория: {category}\n"
+            f"Срок: {task['deadline']}\n"
+            f"{reminder} · {status}"
+        )
+        
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("Отметить", callback_data=f"done_{task_id}"),
+                    InlineKeyboardButton("Редактировать", callback_data=f"edit_task_{task_id}"),
+                ],
+                [
+                    InlineKeyboardButton("Напоминание", callback_data=f"toggle_reminder_{task_id}"),
+                    InlineKeyboardButton("Удалить", callback_data=f"delete_task_{task_id}"),
+                ],
+                [InlineKeyboardButton("Назад", callback_data="back_to_tasks")],
+            ]
+        )
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except BotError as e:
+        await query.edit_message_text(f"❌ {e.message}")
+
+async def task_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Хендлер для отображения деталей задачи."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        task_id = int(query.data.split("_")[1])
+        await show_task_detail(query, task_id)
+    except (ValueError, IndexError):
+        await query.edit_message_text("Ошибка в ID задачи.")
+
+async def done_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отметка задачи как выполненной."""
+    query = update.callback_query
+    await query.answer("Готово")
+    try:
+        task_id = int(query.data.split("_")[1])
+        TaskService.mark_as_done(task_id)
+        await query.edit_message_text("Задача отмечена выполненной.")
+    except (ValueError, IndexError):
+        await query.edit_message_text("Ошибка в ID задачи.")
+    except BotError as e:
+        await query.edit_message_text(f"❌ {e.message}")
+    
+    from bot import send_menu
+    await send_menu(update, context)
+
+async def delete_task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаление задачи."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        task_id = int(query.data.split("_")[2])
+        TaskService.delete_task(task_id)
+        await query.edit_message_text("Задача удалена.")
+    except (ValueError, IndexError):
+        await query.edit_message_text("Ошибка в ID задачи.")
+    except BotError as e:
+        await query.edit_message_text(f"❌ {e.message}")
+    
+    from bot import send_menu
+    await send_menu(update, context)
+
+async def toggle_reminder_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Переключение напоминания для задачи."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        task_id = int(query.data.split("_")[2])
+        # Для простоты оставляем прямой вызов db, так как это атомарная операция
+        import db
+        db.toggle_task_reminder(task_id)
+        await show_task_detail(query, task_id)
+    except (ValueError, IndexError):
+        await query.edit_message_text("Ошибка в ID задачи.")
+
+async def edit_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Начало редактирования задачи."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        task_id = int(query.data.split("_")[2])
+        context.user_data["edit_task_id"] = task_id
+        await query.edit_message_text("Введите новое название задачи:")
+        return EditState.TASK_TITLE
+    except (ValueError, IndexError):
+        await query.edit_message_text("Ошибка ID задачи.")
+        return ConversationHandler.END
+
+async def edit_task_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обновление названия задачи."""
+    task_id = context.user_data.get("edit_task_id")
+    title = update.message.text.strip()
+    try:
+        if task_id and title:
+            import db
+            db.update_task(task_id, title=title)
+            await update.message.reply_text("Название обновлено.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка при обновлении: {e}")
+        
+    context.user_data.pop("edit_task_id", None)
+    from bot import send_menu
+    await send_menu(update, context)
+    return ConversationHandler.END

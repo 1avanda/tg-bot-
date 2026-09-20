@@ -1,0 +1,316 @@
+import logging
+import os
+from datetime import datetime, timedelta
+from enum import IntEnum
+
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+import db
+import nlp
+from utils import keyboards as kb
+from handlers import tasks, habits, pomodoro
+
+# Загрузка переменных окружения
+load_dotenv()
+
+# Настройка логирования
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ====================== Состояния диалогов ======================
+class TaskState(IntEnum):
+    TITLE = 0
+    DESCRIPTION = 1
+    CATEGORY = 2
+    DEADLINE_DATE = 3
+    CUSTOM_DATE = 4
+    DEADLINE_TIME = 5
+    CUSTOM_TIME = 6
+
+class HabitState(IntEnum):
+    NAME = 7
+    PERIOD_TYPE = 8
+    PERIOD_VALUE = 9
+    REMINDER_TIME = 10
+
+class PomoState(IntEnum):
+    DURATION = 11
+    TASK = 12
+
+class EditState(IntEnum):
+    TASK_TITLE = 13
+    HABIT_NAME = 14
+
+# ====================== Вспомогательные функции ======================
+def uid(update: Update) -> int:
+    """Получает или создает внутренний ID пользователя в БД."""
+    user = update.effective_user
+    return db.get_or_create_user(user.id, user.username)
+
+async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = "Выберите действие:"):
+    """Отправляет главное меню управления."""
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        reply_markup=kb.main_menu_keyboard(),
+    )
+
+def schedule_task_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, title: str, deadline: datetime):
+    """Планирует уведомление о дедлайне задачи."""
+    when = deadline - timedelta(minutes=5)
+    delay = (when - datetime.now()).total_seconds()
+    if delay < 5:
+        delay = 5
+    context.job_queue.run_once(
+        send_reminder_job,
+        when=delay,
+        data={"chat_id": chat_id, "task_title": title},
+    )
+
+async def send_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача для отправки напоминаний."""
+    job = context.job
+    chat_id = job.data["chat_id"]
+    if job.data.get("task_title"):
+        await context.bot.send_message(chat_id, f"Напоминание о задаче: {job.data['task_title']}")
+    elif job.data.get("habit_name"):
+        await context.bot.send_message(chat_id, f"Напоминание о привычке: {job.data['habit_name']}")
+
+async def check_deadlines(context: ContextTypes.DEFAULT_TYPE):
+    """Ежечасная проверка просроченных задач."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for row in db.get_due_tasks(now):
+        await context.bot.send_message(row["telegram_id"], f"Дедлайн задачи «{row['title']}» наступил.")
+
+# ====================== Основные команды ======================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start - приветствие и главное меню."""
+    if update.callback_query:
+        await update.callback_query.answer()
+    uid(update)
+    name = update.effective_user.first_name or ""
+
+    text = (
+        f"Здравствуйте, {name}!\n"
+        f"Я ваш персональный ИИ-помощник по продуктивности.\n\n"
+        f"🚀 *Что я умею:*\n"
+        f"• Управлять задачами и дедлайнами\n"
+        f"• Отслеживать привычки и серии\n"
+        f"• Запускать Pomodoro-таймеры\n"
+        f"• Анализировать вашу статистику\n"
+        f"• Помогать с планированием через ИИ\n\n"
+        f"💡 *Подсказка:* Используйте меню или команды, например:\n"
+        f" /newtask — создать задачу\n"
+        f" /tasks — список активных дел\n"
+        f" /habits — ваши привычки\n"
+        f" /stats — отчет по продуктивности\n"
+        f" /pomo — запуск таймера\n"
+        f" /help — помощь"
+    )
+
+    if update.message:
+        await update.message.reply_text(text, reply_markup=kb.main_menu_keyboard(), parse_mode="Markdown")
+    else:
+        await send_menu(update, context, text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /help - справка по функционалу."""
+    text = (
+        "📖 *Справка по командам:*\n\n"
+        "/start — Перезапустить бота\n"
+        "/newtask — Создать новую задачу\n"
+        "/tasks — Посмотреть список задач\n"
+        "/habits — Управление привычками\n"
+        "/pomo — Запустить Pomodoro\n"
+        "/stats — Ваша статистика\n"
+        "/help — Это сообщение\n\n"
+        "💬 Также вы можете просто писать мне: \n"
+        "«завтра в 10:00 купить хлеб» или «помидор 25 мин»"
+    )
+    await update.message.reply_text(text, reply_markup=kb.main_menu_keyboard(), parse_mode="Markdown")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /stats - статистика продуктивности."""
+    user_id = uid(update)
+    today = datetime.now().date().isoformat()
+    s = db.get_stats(user_id, today)
+    adv = db.get_advanced_stats(user_id)
+    
+    text = (
+        f"📊 *Ваша продуктивность:*\n\n"
+        f"✅ Выполнено сегодня: {s['completed_today']}\n"
+        f"📝 Активных задач: {s['active_tasks']}\n"
+        f"🔥 Привычки: {s['habits_count']} (Всего серия: {s['total_streak']})\n"
+        f"🍅 Pomodoro сегодня: {s['pomodoros_today']}\n\n"
+        f"📈 *Общий прогресс:*\n"
+        f"• Завершено: {adv['completed_tasks']}/{adv['total_tasks']} ({adv['completion_rate']}%)\n"
+        f"• Время фокуса: {adv['total_pomo_minutes']} мин\n"
+        f"• Топ категория: {adv['top_category']}"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def handle_ai_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка всех текстовых сообщений через NLP и ИИ."""
+    text = update.message.text
+    action = await nlp.parse_user_text(text)
+    
+    if action["intent"] == "add_task":
+        desc = nlp.describe_action(action)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Записать", callback_data="ai_confirm")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="ai_cancel")]
+        ])
+        await update.message.reply_text(f"Я понял ваш запрос:\n\n{desc}\n\nЗаписать?", reply_markup=keyboard)
+        context.user_data["ai_pending_action"] = action
+    elif action["intent"] == "list_tasks":
+        await tasks.mytasks(update, context)
+    elif action["intent"] == "start_pomodoro":
+        await pomodoro.start_pomo(update, context)
+    else:
+        user_id = uid(update)
+        user_stats = db.get_stats(user_id, datetime.now().date().isoformat())
+        reply = await nlp.ai_assistant_reply(text, user_context=str(user_stats))
+        await update.message.reply_text(reply)
+
+async def ai_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение записи задачи, предложенной ИИ."""
+    query = update.callback_query
+    await query.answer()
+    action = context.user_data.get("ai_pending_action")
+    if not action:
+        await query.edit_message_text("Данные устарели. Попробуйте снова.")
+        return
+        
+    user_id = uid(update)
+    if action["intent"] == "add_task":
+        db.add_task(
+            user_id,
+            action["title"],
+            action["description"],
+            action["category"],
+            action["deadline"]
+        )
+        await query.edit_message_text(f"Задача «{action['title']}» успешно добавлена!")
+    
+    context.user_data.pop("ai_pending_action", None)
+
+async def ai_cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена действия, предложенного ИИ."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Действие отменено.")
+    context.user_data.pop("ai_pending_action", None)
+
+# ====================== Главная функция запуска ======================
+def main():
+    application = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+
+    # 1. Базовые команды
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("tasks", tasks.mytasks))
+    application.add_handler(CommandHandler("habits", habits.habits_list))
+    application.add_handler(CommandHandler("pomo", pomodoro.start_pomo))
+    application.add_handler(CommandHandler("newtask", tasks.newtask))
+
+    # 2. Разговоры (ConversationHandlers)
+    
+    # Создание задачи
+    task_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("newtask", tasks.newtask), 
+            MessageHandler(filters.Regex(r"^Новая задача$"), tasks.newtask)
+        ],
+        states={
+            TaskState.TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, tasks.task_title)],
+            TaskState.DESCRIPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, tasks.task_description), 
+                CallbackQueryHandler(tasks.skip_description, pattern="^skip_desc$")
+            ],
+            TaskState.CATEGORY: [CallbackQueryHandler(tasks.task_category)],
+            TaskState.DEADLINE_DATE: [CallbackQueryHandler(tasks.task_deadline_date)],
+            TaskState.CUSTOM_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, tasks.task_custom_date)],
+            TaskState.DEADLINE_TIME: [CallbackQueryHandler(tasks.task_deadline_time)],
+            TaskState.CUSTOM_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, tasks.task_custom_time)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+    application.add_handler(task_conv)
+
+    # Создание привычки
+    habit_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("habits", habits.habits_list), 
+            MessageHandler(filters.Regex(r"^Привычки$"), habits.habits_list), 
+            CommandHandler("newhabit", habits.newhabit)
+        ],
+        states={
+            HabitState.NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, habits.habit_name)],
+            HabitState.PERIOD_TYPE: [CallbackQueryHandler(habits.habit_period_type)],
+            HabitState.PERIOD_VALUE: [
+                CallbackQueryHandler(habits.habit_period_value), 
+                MessageHandler(filters.TEXT & ~filters.COMMAND, habits.habit_period_value)
+            ],
+            HabitState.REMINDER_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, habits.habit_reminder_time)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+    application.add_handler(habit_conv)
+
+    # Pomodoro таймер
+    pomo_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("pomo", pomodoro.start_pomo), 
+            MessageHandler(filters.Regex(r"^Pomodoro$"), pomodoro.start_pomo)
+        ],
+        states={
+            PomoState.DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, pomodoro.pomo_duration)],
+            PomoState.TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, pomodoro.pomo_task)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+    application.add_handler(pomo_conv)
+
+    # 3. Обработка Callback-запросов (вне диалогов)
+    application.add_handler(CallbackQueryHandler(tasks.task_detail, pattern="^task_"))
+    application.add_handler(CallbackQueryHandler(tasks.done_task_handler, pattern="^done_"))
+    application.add_handler(CallbackQueryHandler(tasks.delete_task_handler, pattern="^delete_task_"))
+    application.add_handler(CallbackQueryHandler(tasks.toggle_reminder_handler, pattern="^toggle_reminder_"))
+    application.add_handler(CallbackQueryHandler(habits.habit_detail, pattern="^habit_"))
+    application.add_handler(CallbackQueryHandler(habits.check_habit_handler, pattern="^check_habit_"))
+    application.add_handler(CallbackQueryHandler(habits.toggle_habit_reminder_handler, pattern="^toggle_habit_reminder_"))
+    application.add_handler(CallbackQueryHandler(habits.delete_habit_handler, pattern="^delete_habit_"))
+    application.add_handler(CallbackQueryHandler(pomodoro.stop_pomo, pattern="^stop_pomo$"))
+    application.add_handler(CallbackQueryHandler(tasks.edit_task_start, pattern="^edit_task_"))
+    application.add_handler(CallbackQueryHandler(habits.edit_habit_start, pattern="^edit_habit_start"))
+    application.add_handler(CallbackQueryHandler(ai_confirm_handler, pattern="^ai_confirm$"))
+    application.add_handler(CallbackQueryHandler(ai_cancel_handler, pattern="^ai_cancel$"))
+    
+    application.add_handler(CallbackQueryHandler(tasks.mytasks, pattern="^back_to_tasks$"))
+    application.add_handler(CallbackQueryHandler(tasks.mytasks, pattern="^back_main$"))
+
+    # 4. Обработка всех текстовых сообщений (ИИ-ассистент)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_request))
+
+    # Планировщик задач (Проверка дедлайнов каждый час)
+    application.job_queue.run_repeating(check_deadlines, interval=3600)
+
+    # Запуск бота
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
