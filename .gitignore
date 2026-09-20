@@ -8,7 +8,7 @@
 
 # Python (кэш и временные файлы)
 __pycache__/
-*.py[cod]
+*.py`
 *$py.class
 *.pyc
 
